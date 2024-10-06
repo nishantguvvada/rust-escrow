@@ -2,128 +2,233 @@ use anchor_lang::prelude::*;
 
 use anchor_spl::{
     associated_token::AssociatedToken,
-    token::{self, Token, TokenAccount, Transfer as SplTransfer},
+    token::Token,
+    token_interface::{
+        close_account, transfer_checked, CloseAccount, Mint, TokenAccount, TransferChecked,
+    }, // Transfer as SplTransfer
 };
 
-use spl_associated_token_account::{get_associated_token_address, instruction as Splinstruction};
-use std::str::FromStr;
-
-declare_id!("4AbKnJAgoDzwULHEiaLXZeR6kgr2JwqngG78HFa38bkg");
+declare_id!("EJamS2fTjyjPWAbWfZtchoyKtZz5szhiaZH1imAbNJHR");
 
 #[program]
 pub mod escrow {
     use super::*;
 
-    // init escrow account
-    pub fn init_escrow(ctx: Context<InitEscrow>, amount: u64, mint_address: Pubkey) -> Result<()> {
-        let escrow = &mut ctx.accounts.escrow;
-        escrow.amount = amount; // amount
-        escrow.mint_address = mint_address; // public key of mint
-        escrow.escrow_owner = ctx.accounts.signer.key(); // user initiating escrow
+    // init escrow account (PDA) and create an escrow ATA and transfer the token from user ATA to escrow ATA
+    pub fn escrow_transfer(
+        ctx: Context<EscrowTransfer>,
+        amount: u64,
+        mint_address: Pubkey,
+        seed: u64,
+    ) -> Result<()> {
+        ctx.accounts.escrow.amount = amount; // amount
+        ctx.accounts.escrow.mint_address = mint_address; // public key of mint
+        ctx.accounts.escrow.escrow_owner = ctx.accounts.maker.key(); // user initiating escrow
+        ctx.accounts.escrow.seed = seed; //
+
+        let cpi_program = ctx.accounts.token_program.to_account_info();
+
+        let cpi_accounts = TransferChecked {
+            from: ctx.accounts.maker_ata.to_account_info(),
+            mint: ctx.accounts.mint.to_account_info(),
+            to: ctx.accounts.escrow_ata.to_account_info(),
+            authority: ctx.accounts.maker.to_account_info(),
+        };
+
+        let result = transfer_checked(
+            CpiContext::new(cpi_program.clone(), cpi_accounts),
+            amount,
+            ctx.accounts.mint.decimals,
+        );
+
+        match result {
+            Ok(..) => print!("Success"),
+            Err(..) => print!("Error"),
+        };
 
         Ok(())
     }
 
-    pub fn create_ata(ctx: Context<CreateATA>) -> Result<()> {
-        let wallet_owner = &ctx.accounts.escrow;
-        let token_mint_address = &ctx.accounts.escrow.mint_address;
-        let signer = &ctx.accounts.signer;
-        let token_program = &ctx.accounts.token_program;
-        let system_program = &ctx.accounts.system_program;
-        let associate_token_program = &ctx.accounts.associated_token_program;
+    pub fn taker_withdraw(ctx: Context<TakerWithdraw>) -> Result<()> {
+        let mint = &ctx.accounts.mint;
+        let maker = &ctx.accounts.maker;
+        let _taker = &ctx.accounts.taker; // _ indicates unused variable
+        let taker_ata = &ctx.accounts.taker_ata;
+        let escrow = &ctx.accounts.escrow;
         let escrow_ata = &ctx.accounts.escrow_ata;
-        let ata_key = get_associated_token_address(&wallet_owner.key(), &token_mint_address.key());
+        let token_program = &ctx.accounts.token_program;
 
-        require_eq!(ata_key, escrow_ata.key());
+        let cpi_program = token_program.to_account_info();
+        let cpi_accounts = TransferChecked {
+            from: escrow_ata.to_account_info(),
+            mint: mint.to_account_info(),
+            to: taker_ata.to_account_info(),
+            authority: escrow.to_account_info(),
+        };
 
-        if escrow_ata.get_lamports() == 0 {
-            msg!("Creating associated token account for escrow!");
-            anchor_lang::solana_program::program::invoke(
-                &Splinstruction::create_associated_token_account(
-                    &signer.key(),
-                    &wallet_owner.key(),
-                    &token_mint_address.key(),
-                    &token_program.key(),
-                ),
-                &[signer.to_account_info().clone()],
-            )?;
-        } else {
-            msg!("Associated token account exists!")
-        }
-        msg!("ATA created!");
+        let maker_binding = maker.to_account_info().key();
+        let mint_binding = mint.to_account_info().key();
+
+        let seeds = [b"seed", maker_binding.as_ref(), mint_binding.as_ref()]; // seeds to build escrow ATA required for signing: master_seed, user and mint public key
+
+        transfer_checked(
+            CpiContext::new_with_signer(cpi_program.clone(), cpi_accounts, &[&seeds[..]]),
+            escrow_ata.amount,
+            mint.decimals,
+        )?;
+
+        let cpi_close_accounts = CloseAccount {
+            // closing the escrow ATA
+            account: escrow_ata.to_account_info(),
+            destination: maker.to_account_info(),
+            authority: escrow.to_account_info(),
+        };
+
+        let close_result = close_account(CpiContext::new_with_signer(
+            cpi_program.clone(),
+            cpi_close_accounts,
+            &[&seeds[..]],
+        ));
+
+        match close_result {
+            Ok(..) => print!("Success"),
+            Err(..) => print!("Error"),
+        };
+
         Ok(())
     }
 
-    pub fn transfer_token(ctx: Context<TransferToken>) -> Result<()> {
-        let source = &ctx.accounts.from_ata;
-        let destination = &ctx.accounts.to_ata;
-        let authority = &ctx.accounts.from;
+    pub fn refund_maker(ctx: Context<RefundMaker>) -> Result<()> {
         let token_program = &ctx.accounts.token_program;
-        let amount = &ctx.accounts.escrow.amount;
+        let escrow = &ctx.accounts.escrow;
+        let escrow_ata = &ctx.accounts.escrow_ata;
+        let mint = &ctx.accounts.mint;
+        let maker = &ctx.accounts.maker;
+        let maker_ata = &ctx.accounts.maker_ata;
 
-        let cpi_accounts = SplTransfer {
-            from: source.to_account_info().clone(),
-            to: destination.to_account_info().clone(),
-            authority: authority.to_account_info().clone(),
+        let cpi_accounts = TransferChecked {
+            from: escrow_ata.to_account_info(),
+            mint: mint.to_account_info(),
+            to: maker_ata.to_account_info(),
+            authority: escrow.to_account_info(),
         };
 
         let cpi_program = token_program.to_account_info();
 
-        token::transfer(CpiContext::new(cpi_program, cpi_accounts), *amount)?;
+        let maker_binding = maker.to_account_info().key();
+        let mint_binding = mint.to_account_info().key();
 
-        msg!("Token transferred!");
+        let seeds = [b"seed", maker_binding.as_ref(), mint_binding.as_ref()]; // seeds to build escrow ATA required for signing: master_seed, user and mint public key
+
+        transfer_checked(
+            CpiContext::new_with_signer(cpi_program.clone(), cpi_accounts, &[&seeds[..]]),
+            escrow_ata.amount,
+            mint.decimals,
+        )?;
+
+        let cpi_close_accounts = CloseAccount {
+            account: escrow_ata.to_account_info(),
+            destination: maker.to_account_info(),
+            authority: escrow.to_account_info(),
+        };
+
+        let close_result = close_account(CpiContext::new_with_signer(
+            cpi_program.clone(),
+            cpi_close_accounts,
+            &[&seeds[..]],
+        ));
+
+        match close_result {
+            Ok(..) => print!("Success"),
+            Err(..) => print!("Error"),
+        };
+
         Ok(())
     }
-
 }
 
 #[derive(Accounts)]
-pub struct InitEscrow<'info> {
+#[instruction(seed: u64)]
+pub struct EscrowTransfer<'info> {
+    #[account(
+        init_if_needed,
+        payer = maker,
+        seeds=[b"seed", maker.key().as_ref(), mint.key().as_ref()],
+        bump,
+        space = 8 + Escrow::INIT_SPACE,
+    )]
+    pub escrow: Account<'info, Escrow>, // escrow PDA
+
     #[account(
         init,
-        space = 8 + 8 + 32 + 32,
-        seeds=[b"escrow", signer.key().as_ref()],
-        bump,
-        payer = signer
+        payer = maker,
+        associated_token::mint = mint,
+        associated_token::authority = escrow
     )]
-    pub escrow: Account<'info, Escrow>,
+    pub escrow_ata: InterfaceAccount<'info, TokenAccount>, // escrow ATA
 
     #[account(mut)]
-    pub signer: Signer<'info>,
+    pub mint: InterfaceAccount<'info, Mint>, // mint to be transferred
+
+    #[account(
+        mut,
+        associated_token::mint = mint,
+        associated_token::authority = maker
+    )]
+    pub maker_ata: InterfaceAccount<'info, TokenAccount>, // user's ATA
+
+    #[account(mut)]
+    pub maker: Signer<'info>, // user initiating the escrow
 
     pub system_program: Program<'info, System>,
+
+    pub token_program: Program<'info, Token>,
+
+    pub associated_token_program: Program<'info, AssociatedToken>,
 }
 
 #[account]
+#[derive(InitSpace)]
 pub struct Escrow {
     pub amount: u64,
     pub mint_address: Pubkey,
     pub escrow_owner: Pubkey,
+    pub seed: u64,
+    pub bump: u8,
 }
 
 #[derive(Accounts)]
-pub struct CreateATA<'info> {
+pub struct TakerWithdraw<'info> {
+    #[account(mut)]
+    pub mint: Box<InterfaceAccount<'info, Mint>>, // Box<> provides a pointer to the heap (memory management)
+
     #[account(
-        seeds=[b"escrow", signer.key().as_ref()],
+        mut,
+        close = maker,
+        seeds=[b"seed", maker.key().as_ref(), mint.key().as_ref()],
         bump
     )]
     pub escrow: Account<'info, Escrow>,
 
     #[account(
-        init_if_needed,
-        payer = signer,
-        seeds = [
-            escrow.key().as_ref(),
-            token_program.key().as_ref(), 
-            escrow.mint_address.key().as_ref()
-        ],
-        bump,
-        space = 8 + 8
+        mut, // init_if_needed and seeds not required because escrow ATA is already initialised
+        associated_token::mint = mint,
+        associated_token::authority = escrow
     )]
-    pub escrow_ata: Account<'info, TokenAccount>,
+    pub escrow_ata: InterfaceAccount<'info, TokenAccount>,
+
+    #[account(
+        init_if_needed,
+        payer = taker,
+        associated_token::mint = mint,
+        associated_token::authority = taker
+    )]
+    pub taker_ata: Box<InterfaceAccount<'info, TokenAccount>>,
 
     #[account(mut)]
-    pub signer: Signer<'info>,
+    pub taker: Signer<'info>, // taker is the signer because taker will now pay fees
+
+    pub maker: SystemAccount<'info>, // SystemAccount validates owner to be system program
 
     pub token_program: Program<'info, Token>,
 
@@ -133,31 +238,34 @@ pub struct CreateATA<'info> {
 }
 
 #[derive(Accounts)] // to create an associated token account, we need:
-pub struct TransferToken<'info> {
+pub struct RefundMaker<'info> {
+    #[account(mut)]
+    pub mint: InterfaceAccount<'info, Mint>,
+
     #[account(
-        seeds=[b"escrow", from.key().as_ref()],
+        mut,
+        close = maker, // constraint handles everything required to securely close an account
+        seeds=[b"seed", maker.key().as_ref(), mint.key().as_ref()],
         bump
     )]
     pub escrow: Account<'info, Escrow>,
 
     #[account(
-        init_if_needed,
-        payer = from,
-        seeds = [
-            escrow.key().as_ref(),
-            token_program.key().as_ref(), 
-            escrow.mint_address.key().as_ref()
-        ],
-        bump,
-        space = 8 + 8
+        mut,
+        associated_token::mint = mint,
+        associated_token::authority = escrow
     )]
-    pub to_ata: Account<'info, TokenAccount>,
+    pub escrow_ata: InterfaceAccount<'info, TokenAccount>,
+
+    #[account(
+        mut,
+        associated_token::mint = mint,
+        associated_token::authority = maker
+    )]
+    pub maker_ata: InterfaceAccount<'info, TokenAccount>,
 
     #[account(mut)]
-    pub from_ata: Account<'info, TokenAccount>,
-
-    #[account(mut)]
-    pub from: Signer<'info>,
+    pub maker: Signer<'info>,
 
     pub token_program: Program<'info, Token>,
 
